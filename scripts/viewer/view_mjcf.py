@@ -59,6 +59,14 @@ def main():
     model = mujoco.MjModel.from_xml_path(filepath)
     data = mujoco.MjData(model)
 
+    print(f"\n--- 関節一覧 ({model.njnt}) ---")
+    for i in range(model.njnt):
+        name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, i)
+        qpos_adr = model.jnt_qposadr[i]
+        dof_adr = model.jnt_dofadr[i]
+        print(f"{i}: {name}, qpos_adr={qpos_adr}, dof_adr={dof_adr}")
+    print()
+
     paused = False
     # 過去の状態を保存するリングバッファ
     history = collections.deque(maxlen=HISTORY_SIZE)
