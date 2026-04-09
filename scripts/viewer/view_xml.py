@@ -1,65 +1,114 @@
+"""
+MuJoCo XMLファイルビューワー
+
+Usage:
+    python scripts/viewer/view_xml.py <filename>
+    python scripts/viewer/view_xml.py scene.xml
+    python scripts/viewer/view_xml.py xml/scene.xml
+
+キー操作:
+    Space   : 一時停止 / 再開
+    →       : 1ステップ進む (停止中のみ)
+    ←       : 1ステップ戻る
+"""
+
 import argparse
-from pathlib import Path
+import collections
+import os
+import sys
 
 import mujoco
-import numpy as np
-from PIL import Image
+import mujoco.viewer
+
+HISTORY_SIZE = 1000
+# GLFW key codes
+KEY_SPACE = 32
+KEY_RIGHT = 262
+KEY_LEFT = 263
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Render MuJoCo XML to PNG")
-    parser.add_argument("xml_path", type=str, help="Path to MuJoCo XML file (scene.xml or model.xml)")
-    parser.add_argument("--output", type=str, default=None, help="Output PNG path (default: image/xml/<stem>.png)")
-    parser.add_argument("--width", type=int, default=640, help="Image width (default: 640, XMLのoffscreenバッファ上限に注意)")
-    parser.add_argument("--height", type=int, default=480, help="Image height (default: 480)")
-    parser.add_argument("--camera", type=str, default=None, help="Camera name to use (default: free camera)")
-    parser.add_argument("--list-cameras", action="store_true", help="List available cameras and exit")
-    return parser.parse_args()
+def main():
+    parser = argparse.ArgumentParser(description="MuJoCo XMLファイルをビューワーで表示する")
+    parser.add_argument(
+        "filename",
+        help="XMLファイルのパス。xml/ディレクトリ内のファイル名のみでも可 (例: scene.xml)",
+    )
+    args = parser.parse_args()
 
+    filepath = args.filename
 
-def main() -> int:
-    args = parse_args()
-    xml_path = Path(args.xml_path)
+    # ファイルが見つからない場合、xml/ディレクトリから探す
+    if not os.path.isfile(filepath):
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        candidate = os.path.join(repo_root, "xml", filepath)
+        if os.path.isfile(candidate):
+            filepath = candidate
+        else:
+            print(f"Error: ファイルが見つかりません: {args.filename}", file=sys.stderr)
+            xml_dir = os.path.join(repo_root, "xml")
+            if os.path.isdir(xml_dir):
+                print("xml/ ディレクトリ内のファイル一覧:", file=sys.stderr)
+                for f in sorted(os.listdir(xml_dir)):
+                    if f.endswith(".xml"):
+                        print(f"  {f}", file=sys.stderr)
+            sys.exit(1)
 
-    if not xml_path.exists():
-        print(f"[ERROR] XML not found: {xml_path}")
-        return 1
+    print(f"Loading: {filepath}")
+    print("Space: 停止/再開  ←: 1ステップ戻る  →: 1ステップ進む (停止中)")
 
-    model = mujoco.MjModel.from_xml_path(str(xml_path))
+    model = mujoco.MjModel.from_xml_path(filepath)
     data = mujoco.MjData(model)
-    mujoco.mj_forward(model, data)
 
-    if args.list_cameras:
-        print("Available cameras:")
-        for i in range(model.ncam):
-            name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_CAMERA, i)
-            print(f"  [{i}] {name}")
-        return 0
+    print(f"\n--- 関節一覧 ({model.njnt}) ---")
+    for i in range(model.njnt):
+        name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, i)
+        qpos_adr = model.jnt_qposadr[i]
+        dof_adr = model.jnt_dofadr[i]
+        print(f"{i}: {name}, qpos_adr={qpos_adr}, dof_adr={dof_adr}")
+    print()
 
-    renderer = mujoco.Renderer(model, width=args.width, height=args.height)
+    paused = False
+    history = collections.deque(maxlen=HISTORY_SIZE)
 
-    if args.camera is not None:
-        cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, args.camera)
-        if cam_id == -1:
-            print(f"[ERROR] Camera not found: {args.camera}")
-            return 1
-        renderer.update_scene(data, camera=args.camera)
-    else:
-        renderer.update_scene(data)
+    def save_state():
+        history.append({
+            "qpos": data.qpos.copy(),
+            "qvel": data.qvel.copy(),
+            "act":  data.act.copy(),
+            "time": data.time,
+        })
 
-    img = renderer.render()
+    def restore_state(state):
+        data.qpos[:] = state["qpos"]
+        data.qvel[:] = state["qvel"]
+        data.act[:]  = state["act"]
+        data.time    = state["time"]
+        mujoco.mj_forward(model, data)
 
-    if args.output is not None:
-        out_path = Path(args.output)
-    else:
-        out_dir = Path("image/xml")
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / f"{xml_path.stem}.png"
+    def key_callback(keycode):
+        nonlocal paused
+        if keycode == KEY_SPACE:
+            paused = not paused
+            print("停止中" if paused else "再開")
+        elif keycode == KEY_LEFT:
+            if len(history) > 1:
+                history.pop()
+                restore_state(history[-1])
+            else:
+                print("これ以上戻れません")
+        elif keycode == KEY_RIGHT and paused:
+            save_state()
+            mujoco.mj_step(model, data)
 
-    Image.fromarray(img).save(out_path)
-    print(f"saved: {out_path}  {img.shape}")
-    return 0
+    save_state()
+
+    with mujoco.viewer.launch_passive(model, data, key_callback=key_callback) as viewer:
+        while viewer.is_running():
+            if not paused:
+                save_state()
+                mujoco.mj_step(model, data)
+            viewer.sync()
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
